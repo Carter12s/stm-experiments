@@ -32,7 +32,7 @@ connect_under_reset = false
 
 [default.rtt]
 # Whether or not an RTTUI should be opened after flashing.
-enabled = true
+enabled = false
 up_mode = "BlockIfFull"
 # The duration in ms for which the logger should retry to attach to RTT.
 timeout = 3000
@@ -43,7 +43,7 @@ log_enabled = false
 # Where to save rtt history buffer relative to manifest path.
 log_path = "./logs"
 up_channels = [
-    { channel = 0, mode = "BlockIfFull", format = "Defmt", show_location = true, show_timestamp = true },
+    { channel = 0, mode = "BlockIfFull", format = "String", show_location = true, show_timestamp = true },
 ]
 
 [default.gdb]

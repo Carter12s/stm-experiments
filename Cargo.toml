@@ -12,7 +12,6 @@ panic-halt = "1.0.0"
 embedded-hal = "0.2"
 heapless = "0.8"
 nb = "1.1"
-atat = "0.24"
 defmt = { version = "1.0" }
 defmt-rtt = { version = "1.0" }
 rtt-target = "0.6"

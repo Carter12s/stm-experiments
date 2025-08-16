@@ -1,9 +1,18 @@
+//! WiFi module driver for ISM43362 using eS-WiFi protocol
+//!
+//! This module provides a driver for the ISM43362 WiFi module found on the
+//! STM32L475 Discovery board. It implements the eS-WiFi command protocol
+//! using 16-bit SPI transfers as specified in the ISM43362 datasheet.
+//!
+//! The implementation is based on the es-wifi-driver reference implementation
+//! and provides basic WiFi connectivity functionality.
+
 use defmt::{debug, error, info, warn};
 use embedded_hal::blocking::{delay::DelayMs, spi::Transfer};
-use heapless::{String, Vec};
-use nb::block;
+use heapless::String;
+
 use stm32l4xx_hal::{
-    gpio::{gpiob::*, gpioc::*, gpioe::*, Alternate, Output, PushPull},
+    gpio::{gpiob::*, gpioc::*, gpioe::*, Alternate, Input, Output, PullUp, PushPull},
     pac::SPI3,
     spi::Spi,
 };
@@ -16,6 +25,7 @@ use stm32l4xx_hal::{
 // WiFi_RST  -> PE8  (Reset)
 // WiFi_WKUP -> PB13 (Wake up)
 
+/// SPI peripheral type for WiFi communication
 pub type WifiSpi = Spi<
     SPI3,
     (
@@ -25,28 +35,37 @@ pub type WifiSpi = Spi<
     ),
 >;
 
+/// GPIO pins used for WiFi module control
 pub struct WifiPins {
+    /// Chip Select pin (PE0)
     pub cs: PE0<Output<PushPull>>,
+    /// Reset pin (PE8)
     pub reset: PE8<Output<PushPull>>,
+    /// Wake-up pin (PB13)
     pub wakeup: PB13<Output<PushPull>>,
+    /// Data Ready pin (PE1) - indicates when module is ready for communication
+    pub data_ready: PE1<Input<PullUp>>,
 }
 
-// ISM43362 SPI frame structure
-const SPI_FRAME_START: u8 = 0x15;
-const SPI_FRAME_END: u8 = 0x16;
-
-// WiFi connection states
+/// WiFi connection states
 #[derive(Debug, Clone, Copy)]
 pub enum WifiState {
+    /// Module is disconnected from any network
     Disconnected = 0,
+    /// Module is connected to a WiFi network
     Connected = 1,
-    GotIp = 2,
-    Connecting = 3,
 }
 
+/// Main WiFi module driver structure
+///
+/// This structure encapsulates the SPI peripheral, GPIO pins, and state
+/// needed to communicate with the ISM43362 WiFi module using the eS-WiFi protocol.
 pub struct WifiModule {
+    /// SPI peripheral for communication
     pub spi: WifiSpi,
+    /// GPIO pins for module control
     pub pins: WifiPins,
+    /// Current connection state
     state: WifiState,
 }
 
@@ -62,35 +81,244 @@ impl WifiModule {
     pub fn init(&mut self, delay: &mut impl DelayMs<u32>) -> Result<(), &'static str> {
         info!("Starting WiFi module reset sequence...");
 
-        // Reset the WiFi module
+        // Reset the WiFi module (as per es-wifi-driver timing)
         self.pins.reset.set_low();
-        delay.delay_ms(10);
+        delay.delay_ms(50);
         self.pins.reset.set_high();
-        delay.delay_ms(500);
+        delay.delay_ms(50);
         info!("WiFi module reset completed");
 
-        // Wake up the module
+        // Wake up the module (as per es-wifi-driver timing)
         self.pins.wakeup.set_high();
-        delay.delay_ms(100);
+        delay.delay_ms(50);
         info!("WiFi module wake-up signal sent");
 
-        // Test basic communication
-        info!("Testing basic AT communication...");
-        self.send_at_command("AT\r\n", delay)?;
-        delay.delay_ms(100);
+        // Fetch initial cursor as required by ISM43362 spec
+        info!("Fetching initial cursor...");
+        match self.fetch_initial_cursor(delay) {
+            Ok(cursor) => info!("Successfully fetched initial cursor: '{}'", cursor.as_str()),
+            Err(e) => warn!("Failed to fetch initial cursor: {}", e),
+        }
 
-        // Reset to factory defaults
-        info!("Resetting WiFi module to factory defaults...");
-        self.send_at_command("AT&F\r\n", delay)?;
-        delay.delay_ms(1000);
+        // Disable verbosity as per es-wifi-driver
+        info!("Disabling verbosity...");
+        let _response = self.send_at_command("MT=1\r", delay)?;
 
-        // Set WiFi mode to station
-        info!("Setting WiFi mode to station...");
-        self.send_at_command("AT+CWMODE=1\r\n", delay)?;
-        delay.delay_ms(500);
+        // Test basic communication using eS-WiFi commands
+        info!("Testing basic eS-WiFi communication...");
+        let version_response = self.send_at_command("MR\r", delay)?; // Get module version
+        info!("Module version info: {}", version_response.as_str());
 
         info!("WiFi module initialization completed successfully");
         Ok(())
+    }
+
+    pub fn check_data_ready_pin(&self) -> bool {
+        // According to ISM43362 spec: CMD/DATA READY pin HIGH = data ready
+        self.pins.data_ready.is_high()
+    }
+
+    /// Fetch initial cursor after power-up/reset
+    pub fn fetch_initial_cursor(
+        &mut self,
+        delay: &mut impl DelayMs<u32>,
+    ) -> Result<String<64>, &'static str> {
+        info!("Fetching initial cursor...");
+
+        // Wait for CMD/DATA READY pin to go HIGH (data ready)
+        let mut timeout = 0;
+        while !self.check_data_ready_pin() && timeout < 1000 {
+            delay.delay_ms(10);
+            timeout += 1;
+        }
+
+        if timeout >= 1000 {
+            return Err("Timeout waiting for initial data ready");
+        }
+
+        info!("Data ready pin is HIGH, fetching cursor...");
+
+        // Select the WiFi module
+        self.pins.cs.set_low();
+        delay.delay_ms(1);
+
+        let mut cursor = String::<64>::new();
+
+        // Clock out 0x0A (Line Feed) until CMD/DATA READY pin goes LOW
+        // Using 8-bit transfers but following 16-bit protocol (send MSB first, then LSB)
+        while self.check_data_ready_pin() {
+            // Send 16-bit word as two 8-bit transfers: MSB first, then LSB
+            let mut tx_msb = [0x0A]; // MSB: Line Feed
+            let rx_msb = self
+                .spi
+                .transfer(&mut tx_msb)
+                .map_err(|_| "SPI transfer failed")?;
+
+            let mut tx_lsb = [0x00]; // LSB: 0x00
+            let rx_lsb = self
+                .spi
+                .transfer(&mut tx_lsb)
+                .map_err(|_| "SPI transfer failed")?;
+
+            // Store received data from both bytes
+            for &received_byte in &[rx_msb[0], rx_lsb[0]] {
+                if received_byte >= 32 && received_byte <= 126 {
+                    cursor
+                        .push(received_byte as char)
+                        .map_err(|_| "Cursor too long")?;
+                }
+            }
+        }
+
+        // Deselect the WiFi module
+        self.pins.cs.set_high();
+        delay.delay_ms(1);
+
+        info!("Received cursor: '{}'", cursor.as_str());
+        Ok(cursor)
+    }
+
+    pub fn test_communication(
+        &mut self,
+        delay: &mut impl DelayMs<u32>,
+    ) -> Result<(), &'static str> {
+        info!("Testing WiFi module communication...");
+
+        // Check initial data ready pin state
+        let data_ready_initial = self.check_data_ready_pin();
+        info!(
+            "Initial data ready pin state: {}",
+            if data_ready_initial {
+                "READY"
+            } else {
+                "NOT READY"
+            }
+        );
+
+        // Send a simple eS-WiFi command to test communication
+        info!("Sending test eS-WiFi command...");
+        self.send_command_16bit("MR\r", delay)?; // Get module version
+
+        // Try to read response (no delay needed - response is event-driven)
+        match self.read_response_16bit(delay) {
+            Ok(response) => info!("Received response: '{}'", response.as_str()),
+            Err(e) => warn!("Failed to read response: {}", e),
+        }
+
+        Ok(())
+    }
+
+    /// Send command using 16-bit SPI transfers as per ISM43362 spec
+    fn send_command_16bit(
+        &mut self,
+        command: &str,
+        delay: &mut impl DelayMs<u32>,
+    ) -> Result<(), &'static str> {
+        info!("Sending 16-bit command: {}", command.trim());
+
+        // Select the WiFi module (as per es-wifi-driver timing)
+        self.pins.cs.set_low();
+        delay.delay_ms(1); // 1ms CS setup time
+
+        // Send command bytes using 16-bit protocol as per es-wifi-driver
+        let cmd_bytes: heapless::Vec<u8, 256> = command.bytes().collect();
+        for chunk in cmd_bytes.chunks(2) {
+            let mut xfer: [u8; 2] = [0; 2];
+            xfer[1] = chunk[0]; // LSB gets first byte
+            if chunk.len() == 2 {
+                xfer[0] = chunk[1]; // MSB gets second byte
+            } else {
+                xfer[0] = 0x0A; // MSB gets 0x0A if odd length
+            }
+
+            self.spi
+                .transfer(&mut xfer)
+                .map_err(|_| "SPI transfer failed")?;
+        }
+
+        // Deselect the WiFi module (minimal hold time as per es-wifi-driver)
+        self.pins.cs.set_high();
+        // No delay needed here - es-wifi-driver uses only 15 microseconds
+
+        // Check data ready pin state after sending command
+        debug!(
+            "Data ready pin after command: {}",
+            if self.check_data_ready_pin() {
+                "HIGH"
+            } else {
+                "LOW"
+            }
+        );
+
+        Ok(())
+    }
+
+    /// Read response using 16-bit SPI transfers as per ISM43362 spec
+    fn read_response_16bit(
+        &mut self,
+        delay: &mut impl DelayMs<u32>,
+    ) -> Result<String<256>, &'static str> {
+        // Wait for data ready signal
+        debug!("Waiting for data ready signal...");
+        let mut timeout = 0;
+        while !self.check_data_ready_pin() && timeout < 100 {
+            delay.delay_ms(10);
+            timeout += 1;
+            if timeout % 10 == 0 {
+                debug!("Still waiting for data ready... timeout: {}", timeout);
+            }
+        }
+
+        // Long timeout is mainly for WiFi connection step
+        if timeout >= 100_000 {
+            error!(
+                "Timeout reached, data ready pin is: {}",
+                if self.check_data_ready_pin() {
+                    "HIGH"
+                } else {
+                    "LOW"
+                }
+            );
+            return Err("Timeout waiting for response data ready");
+        }
+
+        info!("Data ready for response, reading...");
+
+        // Select the WiFi module
+        self.pins.cs.set_low();
+        delay.delay_ms(1);
+
+        let mut response = String::<256>::new();
+
+        // Clock out 0x0A (Line Feed) until CMD/DATA READY pin goes LOW
+        // Using 16-bit protocol as per es-wifi-driver
+        while self.check_data_ready_pin() {
+            let mut xfer: [u8; 2] = [0x0A, 0x0A]; // Send 0x0A in both bytes
+            self.spi
+                .transfer(&mut xfer)
+                .map_err(|_| "SPI transfer failed")?;
+
+            // Store received data, checking for NAK (0x15)
+            const NAK: u8 = 0x15;
+
+            // Process in reverse order as per es-wifi-driver (16 -> 2*8 bits)
+            if xfer[1] != NAK && xfer[1] >= 32 && xfer[1] <= 126 {
+                response
+                    .push(xfer[1] as char)
+                    .map_err(|_| "Response too long")?;
+            }
+            if xfer[0] != NAK && xfer[0] >= 32 && xfer[0] <= 126 {
+                response
+                    .push(xfer[0] as char)
+                    .map_err(|_| "Response too long")?;
+            }
+        }
+
+        // Deselect the WiFi module
+        self.pins.cs.set_high();
+        delay.delay_ms(1);
+
+        Ok(response)
     }
 
     pub fn connect_to_network(
@@ -101,173 +329,148 @@ impl WifiModule {
     ) -> Result<(), &'static str> {
         info!("Starting WiFi connection process...");
 
-        // Disconnect from any existing network
+        // Disconnect from any existing network using eS-WiFi command
         info!("Disconnecting from any existing network...");
-        self.send_at_command("AT+CWQAP\r\n", delay)?;
-        delay.delay_ms(1000);
+        let _response = self.send_at_command("CD\r", delay)?; // Disconnect command
 
-        // Create the join command
-        info!("Creating join command for SSID: {}", ssid);
-        let mut join_cmd: String<128> = String::new();
-        join_cmd
-            .push_str("AT+CWJAP=\"")
-            .map_err(|_| "Command too long")?;
-        join_cmd.push_str(ssid).map_err(|_| "SSID too long")?;
-        join_cmd.push_str("\",\"").map_err(|_| "Command too long")?;
-        join_cmd
+        // Set security mode to WPA2 (CB=2) as per es-wifi-driver
+        info!("Setting security mode to WPA2...");
+        let _response = self.send_at_command("CB=2\r", delay)?; // WPA2 security mode
+
+        // Set SSID using eS-WiFi command
+        info!("Setting SSID: {}", ssid);
+        let mut ssid_cmd: String<128> = String::new();
+        ssid_cmd.push_str("C1=").map_err(|_| "Command too long")?;
+        ssid_cmd.push_str(ssid).map_err(|_| "SSID too long")?;
+        ssid_cmd.push_str("\r").map_err(|_| "Command too long")?;
+        let _response = self.send_at_command(ssid_cmd.as_str(), delay)?;
+
+        // Set password using eS-WiFi command
+        info!("Setting password...");
+        let mut pwd_cmd: String<128> = String::new();
+        pwd_cmd.push_str("C2=").map_err(|_| "Command too long")?;
+        pwd_cmd
             .push_str(password)
             .map_err(|_| "Password too long")?;
-        join_cmd
-            .push_str("\"\r\n")
-            .map_err(|_| "Command too long")?;
+        pwd_cmd.push_str("\r").map_err(|_| "Command too long")?;
+        let _response = self.send_at_command(pwd_cmd.as_str(), delay)?;
 
-        // Send join command
-        info!("Sending WiFi join command...");
-        self.send_at_command(&join_cmd, delay)?;
+        // Set encryption type (C3=4 for WPA2) as per es-wifi-driver
+        info!("Setting encryption type...");
+        let _response = self.send_at_command("C3=4\r", delay)?; // WPA2 encryption
 
-        // Wait for connection (this can take several seconds)
-        info!("Waiting for WiFi connection (up to 10 seconds)...");
-        delay.delay_ms(10000);
+        // Connect to WiFi network using eS-WiFi command
+        info!("Connecting to WiFi network: {}", ssid);
+        let _response = self.send_at_command("C0\r", delay)?; // Connect command
 
-        // Check connection status
-        info!("Checking WiFi connection status...");
-        self.send_at_command("AT+CWJAP?\r\n", delay)?;
-        delay.delay_ms(500);
+        // Check connection status in a loop with ~10 second timeout
+        info!("Waiting for WiFi connection...");
+        let mut connection_attempts = 0;
+        const MAX_CONNECTION_ATTEMPTS: u32 = 20; // 20 attempts * 500ms = 10 seconds
 
-        self.state = WifiState::Connected;
+        loop {
+            delay.delay_ms(500); // Wait 500ms between checks
+            connection_attempts += 1;
+
+            match self.send_at_command("C?\r", delay) {
+                Ok(response) => {
+                    // Parse the response to check if connection was successful
+                    // Look for IP address pattern (xxx.xxx.xxx.xxx) which indicates successful connection
+                    if response.contains("192.168.")
+                        || response.contains("10.")
+                        || response.contains("172.")
+                    {
+                        info!("WiFi connection successful! Status: {}", response.as_str());
+                        self.state = WifiState::Connected;
+                        break;
+                    } else if response.contains("Failed") {
+                        warn!("WiFi connection failed: {}", response.as_str());
+                        return Err("WiFi connection failed");
+                    } else if response.len() > 0 {
+                        debug!(
+                            "Connection attempt {}/{}: {}",
+                            connection_attempts,
+                            MAX_CONNECTION_ATTEMPTS,
+                            response.as_str()
+                        );
+                    } else {
+                        debug!(
+                            "Connection attempt {}/{}: (empty response)",
+                            connection_attempts, MAX_CONNECTION_ATTEMPTS
+                        );
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to check connection status (attempt {}): {}",
+                        connection_attempts, e
+                    );
+                }
+            }
+
+            if connection_attempts >= MAX_CONNECTION_ATTEMPTS {
+                warn!(
+                    "WiFi connection timeout after {} attempts",
+                    MAX_CONNECTION_ATTEMPTS
+                );
+                return Err("WiFi connection timeout");
+            }
+        }
+
         info!("WiFi connection process completed");
         Ok(())
     }
 
-    pub fn get_status(&mut self) -> WifiState {
-        self.state
+    /// Send a custom eS-WiFi command and return the response
+    ///
+    /// This allows external code to send arbitrary eS-WiFi commands
+    /// and process the responses directly.
+    ///
+    /// # Arguments
+    /// * `command` - The eS-WiFi command to send (should end with \r)
+    /// * `delay` - Delay provider for timing
+    ///
+    /// # Returns
+    /// * `Ok(String<256>)` - The response from the WiFi module
+    /// * `Err(&'static str)` - Error message if command failed
+    ///
+    /// # Example
+    /// ```
+    /// let response = wifi.send_command("MR\r", &mut delay)?;
+    /// info!("Module version: {}", response.as_str());
+    /// ```
+    pub fn send_command(
+        &mut self,
+        command: &str,
+        delay: &mut impl DelayMs<u32>,
+    ) -> Result<String<256>, &'static str> {
+        self.send_at_command(command, delay)
     }
 
     fn send_at_command(
         &mut self,
         command: &str,
         delay: &mut impl DelayMs<u32>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<String<256>, &'static str> {
         debug!("Sending AT command: {}", command.trim());
 
-        // Select the WiFi module
-        self.pins.cs.set_low();
-        delay.delay_ms(1);
+        // Send the command using 16-bit protocol
+        self.send_command_16bit(command, delay)?;
 
-        // Send SPI frame start
-        let mut tx_buf = [SPI_FRAME_START];
-        let mut rx_buf = [0u8; 1];
-        self.spi
-            .transfer(&mut tx_buf)
-            .map_err(|_| "SPI transfer failed")?;
+        // Wait a bit for the module to process the command
+        delay.delay_ms(50);
 
-        // Send command length (2 bytes, little endian)
-        let cmd_len = command.len() as u16;
-        let len_bytes = cmd_len.to_le_bytes();
-        let mut tx_len = [len_bytes[0], len_bytes[1]];
-        self.spi
-            .transfer(&mut tx_len)
-            .map_err(|_| "SPI transfer failed")?;
-
-        // Send command data
-        for byte in command.bytes() {
-            let mut tx_data = [byte];
-            self.spi
-                .transfer(&mut tx_data)
-                .map_err(|_| "SPI transfer failed")?;
-        }
-
-        // Send frame end
-        let mut tx_end = [SPI_FRAME_END];
-        self.spi
-            .transfer(&mut tx_end)
-            .map_err(|_| "SPI transfer failed")?;
-
-        // Deselect the WiFi module
-        self.pins.cs.set_high();
-        delay.delay_ms(1);
-
-        Ok(())
-    }
-
-    pub fn send_http_get(
-        &mut self,
-        host: &str,
-        path: &str,
-        delay: &mut impl DelayMs<u32>,
-    ) -> Result<(), &'static str> {
-        // Create TCP connection
-        let mut connect_cmd: String<128> = String::new();
-        connect_cmd
-            .push_str("AT+CIPSTART=\"TCP\",\"")
-            .map_err(|_| "Command too long")?;
-        connect_cmd.push_str(host).map_err(|_| "Host too long")?;
-        connect_cmd
-            .push_str("\",80\r\n")
-            .map_err(|_| "Command too long")?;
-
-        self.send_at_command(&connect_cmd, delay)?;
-        delay.delay_ms(2000);
-
-        // Create HTTP GET request
-        let mut http_request: String<256> = String::new();
-        http_request
-            .push_str("GET ")
-            .map_err(|_| "Request too long")?;
-        http_request.push_str(path).map_err(|_| "Path too long")?;
-        http_request
-            .push_str(" HTTP/1.1\r\nHost: ")
-            .map_err(|_| "Request too long")?;
-        http_request.push_str(host).map_err(|_| "Host too long")?;
-        http_request
-            .push_str("\r\nConnection: close\r\n\r\n")
-            .map_err(|_| "Request too long")?;
-
-        // Send data length
-        let mut send_cmd: String<64> = String::new();
-        send_cmd
-            .push_str("AT+CIPSEND=")
-            .map_err(|_| "Command too long")?;
-
-        // Convert length to string
-        let len_str = http_request.len();
-        let mut len_buffer = [0u8; 10];
-        let mut len_pos = 0;
-        let mut temp_len = len_str;
-
-        if temp_len == 0 {
-            len_buffer[0] = b'0';
-            len_pos = 1;
-        } else {
-            while temp_len > 0 {
-                len_buffer[len_pos] = (temp_len % 10) as u8 + b'0';
-                temp_len /= 10;
-                len_pos += 1;
+        // Read the response using 16-bit protocol
+        match self.read_response_16bit(delay) {
+            Ok(response) => {
+                info!("Response: {}", response.as_str());
+                Ok(response)
             }
-            // Reverse the digits
-            for i in 0..len_pos / 2 {
-                len_buffer.swap(i, len_pos - 1 - i);
+            Err(e) => {
+                warn!("Failed to read response: {}", e);
+                // Return an empty response on error
+                Ok(String::new())
             }
         }
-
-        for i in 0..len_pos {
-            send_cmd
-                .push(len_buffer[i] as char)
-                .map_err(|_| "Command too long")?;
-        }
-        send_cmd.push_str("\r\n").map_err(|_| "Command too long")?;
-
-        self.send_at_command(&send_cmd, delay)?;
-        delay.delay_ms(100);
-
-        // Send HTTP request
-        self.send_at_command(&http_request, delay)?;
-        delay.delay_ms(2000);
-
-        // Close connection
-        self.send_at_command("AT+CIPCLOSE\r\n", delay)?;
-        delay.delay_ms(500);
-
-        Ok(())
     }
 }
