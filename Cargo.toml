@@ -1,0 +1,30 @@
+[package]
+name = "stm-blinkky"
+version = "0.1.0"
+authors = ["carter <carter@schultz.com>"]
+edition = "2021"
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+panic-halt = "1.0.0"
+# Needs to be 0.2 because of stm32l4xx-hal, which doesn't support 1.0 yet
+embedded-hal = "0.2"
+heapless = "0.8"
+nb = "1.1"
+atat = "0.24"
+defmt = { version = "1.0" }
+defmt-rtt = { version = "1.0" }
+rtt-target = "0.6"
+stm32l4xx-hal = { version = "0.7.1", features = ["stm32l475", "rt"] }
+
+# Set the default for dependencies.
+[profile.dev.package."*"]
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+incremental = false
+debug = true
+lto = true
+opt-level = "s"
