@@ -7,6 +7,7 @@
 //! The implementation is based on the es-wifi-driver reference implementation
 //! and provides basic WiFi connectivity functionality.
 
+use cortex_m::asm::nop;
 use defmt::{debug, error, info, warn};
 use embedded_hal::blocking::{delay::DelayMs, spi::Transfer};
 use heapless::String;
@@ -102,11 +103,11 @@ impl WifiModule {
 
         // Disable verbosity as per es-wifi-driver
         info!("Disabling verbosity...");
-        let _response = self.send_at_command("MT=1\r", delay)?;
+        let _response = self.send_at_command("MT=1\r")?;
 
         // Test basic communication using eS-WiFi commands
         info!("Testing basic eS-WiFi communication...");
-        let version_response = self.send_at_command("MR\r", delay)?; // Get module version
+        let version_response = self.send_at_command("MR\r")?; // Get module version
         info!("Module version info: {}", version_response.as_str());
 
         info!("WiFi module initialization completed successfully");
@@ -178,10 +179,7 @@ impl WifiModule {
         Ok(cursor)
     }
 
-    pub fn test_communication(
-        &mut self,
-        delay: &mut impl DelayMs<u32>,
-    ) -> Result<(), &'static str> {
+    pub fn test_communication(&mut self) -> Result<(), &'static str> {
         info!("Testing WiFi module communication...");
 
         // Check initial data ready pin state
@@ -197,28 +195,20 @@ impl WifiModule {
 
         // Send a simple eS-WiFi command to test communication
         info!("Sending test eS-WiFi command...");
-        self.send_command_16bit("MR\r", delay)?; // Get module version
 
-        // Try to read response (no delay needed - response is event-driven)
-        match self.read_response_16bit(delay) {
-            Ok(response) => info!("Received response: '{}'", response.as_str()),
-            Err(e) => warn!("Failed to read response: {}", e),
-        }
+        // Get MAC address
+        let response = self.send_at_command("Z5\r")?;
+        info!("MAC address: {}", response.as_str());
 
         Ok(())
     }
 
     /// Send command using 16-bit SPI transfers as per ISM43362 spec
-    fn send_command_16bit(
-        &mut self,
-        command: &str,
-        delay: &mut impl DelayMs<u32>,
-    ) -> Result<(), &'static str> {
+    fn send_command_16bit(&mut self, command: &str) -> Result<(), &'static str> {
         info!("Sending 16-bit command: {}", command.trim());
 
         // Select the WiFi module (as per es-wifi-driver timing)
         self.pins.cs.set_low();
-        delay.delay_ms(1); // 1ms CS setup time
 
         // Send command bytes using 16-bit protocol as per es-wifi-driver
         let cmd_bytes: heapless::Vec<u8, 256> = command.bytes().collect();
@@ -254,42 +244,18 @@ impl WifiModule {
     }
 
     /// Read response using 16-bit SPI transfers as per ISM43362 spec
-    fn read_response_16bit(
-        &mut self,
-        delay: &mut impl DelayMs<u32>,
-    ) -> Result<String<256>, &'static str> {
+    fn read_response_16bit(&mut self) -> Result<String<256>, &'static str> {
         // Wait for data ready signal
         debug!("Waiting for data ready signal...");
-        let mut timeout = 0;
-        while !self.check_data_ready_pin() && timeout < 100 {
-            delay.delay_ms(10);
-            timeout += 1;
-            if timeout % 10 == 0 {
-                debug!("Still waiting for data ready... timeout: {}", timeout);
-            }
-        }
-
-        // Long timeout is mainly for WiFi connection step
-        if timeout >= 100_000 {
-            error!(
-                "Timeout reached, data ready pin is: {}",
-                if self.check_data_ready_pin() {
-                    "HIGH"
-                } else {
-                    "LOW"
-                }
-            );
-            return Err("Timeout waiting for response data ready");
+        while !self.check_data_ready_pin() {
+            nop();
         }
 
         info!("Data ready for response, reading...");
 
         // Select the WiFi module
         self.pins.cs.set_low();
-        delay.delay_ms(1);
-
         let mut response = String::<256>::new();
-
         // Clock out 0x0A (Line Feed) until CMD/DATA READY pin goes LOW
         // Using 16-bit protocol as per es-wifi-driver
         while self.check_data_ready_pin() {
@@ -302,23 +268,37 @@ impl WifiModule {
             const NAK: u8 = 0x15;
 
             // Process in reverse order as per es-wifi-driver (16 -> 2*8 bits)
-            if xfer[1] != NAK && xfer[1] >= 32 && xfer[1] <= 126 {
+            if xfer[1] != NAK {
                 response
                     .push(xfer[1] as char)
                     .map_err(|_| "Response too long")?;
             }
-            if xfer[0] != NAK && xfer[0] >= 32 && xfer[0] <= 126 {
+            if xfer[0] != NAK {
                 response
                     .push(xfer[0] as char)
                     .map_err(|_| "Response too long")?;
             }
         }
 
+        // Validation
+        let mut lines = response.lines();
+        let _empty_line = lines
+            .next()
+            .ok_or("No starting empty line in command response")?;
+        let first_line = lines.next().ok_or("No response data")?;
+        let reply = lines.next().ok_or("No response reply code")?;
+
+        if reply != "OK" {
+            warn!("Failed command: {}", reply);
+            return Err("Command failed");
+        }
+
+        let data = String::<256>::try_from(first_line)
+            .map_err(|_| "Could not represent data as string")?;
+
         // Deselect the WiFi module
         self.pins.cs.set_high();
-        delay.delay_ms(1);
-
-        Ok(response)
+        Ok(data)
     }
 
     pub fn connect_to_network(
@@ -331,11 +311,11 @@ impl WifiModule {
 
         // Disconnect from any existing network using eS-WiFi command
         info!("Disconnecting from any existing network...");
-        let _response = self.send_at_command("CD\r", delay)?; // Disconnect command
+        let _response = self.send_at_command("CD\r")?; // Disconnect command
 
         // Set security mode to WPA2 (CB=2) as per es-wifi-driver
         info!("Setting security mode to WPA2...");
-        let _response = self.send_at_command("CB=2\r", delay)?; // WPA2 security mode
+        let _response = self.send_at_command("CB=2\r")?; // WPA2 security mode
 
         // Set SSID using eS-WiFi command
         info!("Setting SSID: {}", ssid);
@@ -343,7 +323,7 @@ impl WifiModule {
         ssid_cmd.push_str("C1=").map_err(|_| "Command too long")?;
         ssid_cmd.push_str(ssid).map_err(|_| "SSID too long")?;
         ssid_cmd.push_str("\r").map_err(|_| "Command too long")?;
-        let _response = self.send_at_command(ssid_cmd.as_str(), delay)?;
+        let _response = self.send_at_command(ssid_cmd.as_str())?;
 
         // Set password using eS-WiFi command
         info!("Setting password...");
@@ -353,15 +333,15 @@ impl WifiModule {
             .push_str(password)
             .map_err(|_| "Password too long")?;
         pwd_cmd.push_str("\r").map_err(|_| "Command too long")?;
-        let _response = self.send_at_command(pwd_cmd.as_str(), delay)?;
+        let _response = self.send_at_command(pwd_cmd.as_str())?;
 
         // Set encryption type (C3=4 for WPA2) as per es-wifi-driver
         info!("Setting encryption type...");
-        let _response = self.send_at_command("C3=4\r", delay)?; // WPA2 encryption
+        let _response = self.send_at_command("C3=4\r")?; // WPA2 encryption
 
         // Connect to WiFi network using eS-WiFi command
         info!("Connecting to WiFi network: {}", ssid);
-        let _response = self.send_at_command("C0\r", delay)?; // Connect command
+        let _response = self.send_at_command("C0\r")?; // Connect command
 
         // Check connection status in a loop with ~10 second timeout
         info!("Waiting for WiFi connection...");
@@ -372,7 +352,7 @@ impl WifiModule {
             delay.delay_ms(500); // Wait 500ms between checks
             connection_attempts += 1;
 
-            match self.send_at_command("C?\r", delay) {
+            match self.send_at_command("C?\r") {
                 Ok(response) => {
                     // Parse the response to check if connection was successful
                     // Look for IP address pattern (xxx.xxx.xxx.xxx) which indicates successful connection
@@ -421,47 +401,14 @@ impl WifiModule {
         Ok(())
     }
 
-    /// Send a custom eS-WiFi command and return the response
-    ///
-    /// This allows external code to send arbitrary eS-WiFi commands
-    /// and process the responses directly.
-    ///
-    /// # Arguments
-    /// * `command` - The eS-WiFi command to send (should end with \r)
-    /// * `delay` - Delay provider for timing
-    ///
-    /// # Returns
-    /// * `Ok(String<256>)` - The response from the WiFi module
-    /// * `Err(&'static str)` - Error message if command failed
-    ///
-    /// # Example
-    /// ```
-    /// let response = wifi.send_command("MR\r", &mut delay)?;
-    /// info!("Module version: {}", response.as_str());
-    /// ```
-    pub fn send_command(
-        &mut self,
-        command: &str,
-        delay: &mut impl DelayMs<u32>,
-    ) -> Result<String<256>, &'static str> {
-        self.send_at_command(command, delay)
-    }
-
-    fn send_at_command(
-        &mut self,
-        command: &str,
-        delay: &mut impl DelayMs<u32>,
-    ) -> Result<String<256>, &'static str> {
+    fn send_at_command(&mut self, command: &str) -> Result<String<256>, &'static str> {
         debug!("Sending AT command: {}", command.trim());
 
         // Send the command using 16-bit protocol
-        self.send_command_16bit(command, delay)?;
-
-        // Wait a bit for the module to process the command
-        delay.delay_ms(50);
+        self.send_command_16bit(command)?;
 
         // Read the response using 16-bit protocol
-        match self.read_response_16bit(delay) {
+        match self.read_response_16bit() {
             Ok(response) => {
                 info!("Response: {}", response.as_str());
                 Ok(response)

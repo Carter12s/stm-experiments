@@ -133,7 +133,7 @@ fn main() -> ! {
 
             // Test communication with WiFi module
             info!("Testing WiFi module communication...");
-            match wifi.test_communication(&mut delay) {
+            match wifi.test_communication() {
                 Ok(_) => {
                     info!("WiFi communication test completed");
                 }
@@ -153,7 +153,13 @@ fn main() -> ! {
     let password = "5$FootLong";
 
     info!("Attempting to connect to WiFi network: {}", ssid);
-    let _ = wifi.connect_to_network(ssid, password, &mut delay);
+    match wifi.connect_to_network(ssid, password, &mut delay) {
+        Ok(_) => info!("WiFi connection successful"),
+        Err(_) => {
+            error!("Failed to connect to WiFi network...");
+            loop {}
+        }
+    }
 
     // Main loop - slow blink to show system is running
     info!("Entering main loop - system operational");
